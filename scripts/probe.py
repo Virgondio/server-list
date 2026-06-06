@@ -26,7 +26,6 @@ def probe_one(query_bin, address, timeout):
         query_bin, "info", address,
         "-j", "-c", "-P",
         "-t", str(int(timeout)),  # xash3d-query rejects fractional seconds
-        "-M", "127.0.0.1:27010",  # bug workaround: skip DNS on the default master list
     ]
     try:
         out = subprocess.run(

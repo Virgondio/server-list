@@ -1,0 +1,93 @@
+name: Validate PR
+
+# pull_request_target so the comment-posting step has write access on PRs
+# from forks. Only trusted code from the base ref runs: the checkout below
+# pins to base.sha, and the validator consumes the PR's TOML files as data
+# via `git show` (no script execution from the PR).
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'servers/**.toml'
+      - 'scripts/probe.py'
+      - 'scripts/validate-pr.py'
+      - '.github/workflows/validate-pr.yml'
+
+concurrency:
+  group: validate-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout base (trusted)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: Fetch PR head
+        run: |
+          git fetch --no-tags --depth=1 origin \
+            "pull/${{ github.event.pull_request.number }}/head"
+
+      - name: Download latest xash3d-query
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .xash3d-master
+          cd .xash3d-master
+          gh release download continuous \
+            --repo FWGS/xash3d-master \
+            --pattern '*x86_64-unknown-linux-gnu*'
+          tar --use-compress-program=unzstd -xf xash3d-master-*.tar.zst
+          chmod +x xash3d-query
+          ./xash3d-query --version
+
+      - name: Validate PR additions
+        run: |
+          ./scripts/validate-pr.py \
+            --base-ref "${{ github.event.pull_request.base.sha }}" \
+            --head-ref "${{ github.event.pull_request.head.sha }}" \
+            --query "$PWD/.xash3d-master/xash3d-query" \
+            --sources servers \
+            --probe-script scripts/probe.py \
+            --tries 3 \
+            --timeout 2 \
+            --out report.md
+          echo '--- report.md ---'
+          cat report.md
+
+      - name: Post or update PR comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ ! -s report.md ]; then
+            echo "no report produced, skipping comment"
+            exit 0
+          fi
+          marker='<!-- pr-validate-bot -->'
+          comment_id=$(gh api --paginate \
+            "repos/${REPO}/issues/${PR}/comments" \
+            --jq ".[] | select(.body | startswith(\"${marker}\")) | .id" \
+            | head -n1)
+          if [ -n "${comment_id}" ]; then
+            gh api -X PATCH \
+              "repos/${REPO}/issues/comments/${comment_id}" \
+              -F body=@report.md >/dev/null
+            echo "updated comment ${comment_id}"
+          else
+            gh api -X POST \
+              "repos/${REPO}/issues/${PR}/comments" \
+              -F body=@report.md >/dev/null
+            echo "posted new comment"
+          fi

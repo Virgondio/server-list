@@ -19,7 +19,9 @@ PROTO_GOLDSRC = 48
 LIVE_STATUSES = ("ok", "okwithplayers")
 BACKOFF = (0.25, 1.0, 2.0, 4.0, 4.0)
 STATE_PRUNE_HOURS = 30 * 24
-SAMPLE_RETAIN_HOURS = 14 * 24
+HOUR_WINDOW_HOURS = 14 * 24
+WEEKDAY_WINDOW_HOURS = 6 * 7 * 24
+SAMPLE_RETAIN_HOURS = WEEKDAY_WINDOW_HOURS
 
 def probe_one(query_bin, address, timeout):
 	cmd = [query_bin, "info", address, "-j", "-c", "-P", "-t", str(int(timeout))]
@@ -79,26 +81,17 @@ def write_output(output_dir, gamedir, addresses):
 	out_path.write_text("\n".join(lines))
 	return out_path
 
-def write_index(output_dir, sources, samples, now):
-	gamedirs = sorted(sources.keys())
-
-	grid = {}
-	for gd in gamedirs:
-		buckets = [[] for _ in range(24)]
-		for ts, count in samples.get(gd, []):
-			hour = datetime.fromtimestamp(ts, tz=timezone.utc).hour
-			buckets[hour].append(int(count))
-		grid[gd] = [statistics.median(b) if b else None for b in buckets]
+def heatmap_svg(gamedirs, grid, col_labels, cell_w):
+	cell_h = 30
+	label_w = 90
+	cols = len(col_labels)
+	width = label_w + cols * cell_w
+	height = (len(gamedirs) + 1) * cell_h
 
 	all_vals = [v for row in grid.values() for v in row if v is not None]
 	vmax = max(all_vals) if all_vals else 0
 
-	cell_w, cell_h = 36, 30
-	label_w = 90
-	grid_w = label_w + 24 * cell_w
-	grid_h = (len(gamedirs) + 1) * cell_h
-
-	def cell_color(v):
+	def color(v):
 		if v is None:
 			return "#f3f4f6"
 		if vmax <= 0:
@@ -109,7 +102,7 @@ def write_index(output_dir, sources, samples, now):
 		b = int(255 + (129 - 255) * t)
 		return f"#{r:02x}{g:02x}{b:02x}"
 
-	def cell_text_color(v):
+	def text_color(v):
 		if v is None or vmax <= 0:
 			return "#9ca3af"
 		return "#ffffff" if (v / vmax) > 0.45 else "#1f2937"
@@ -121,29 +114,54 @@ def write_index(output_dir, sources, samples, now):
 			return str(int(v))
 		return f"{v:.1f}"
 
-	parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {grid_w} {grid_h}" width="100%" style="max-width:{grid_w}px" font-family="system-ui,sans-serif" font-size="11">']
-	for h in range(24):
-		x = label_w + h * cell_w + cell_w // 2
-		parts.append(f'<text x="{x}" y="{cell_h // 2 + 4}" text-anchor="middle" fill="#6b7280">{h:02d}</text>')
+	parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="100%" style="max-width:{width}px" font-family="system-ui,sans-serif" font-size="11">']
+	for i, lbl in enumerate(col_labels):
+		x = label_w + i * cell_w + cell_w // 2
+		parts.append(f'<text x="{x}" y="{cell_h // 2 + 4}" text-anchor="middle" fill="#6b7280">{html.escape(lbl)}</text>')
 	for ri, gd in enumerate(gamedirs):
 		y = (ri + 1) * cell_h
 		parts.append(f'<text x="{label_w - 8}" y="{y + cell_h // 2 + 4}" text-anchor="end" fill="#1f2937">{html.escape(gd)}</text>')
-		for h in range(24):
-			v = grid[gd][h]
-			x = label_w + h * cell_w
-			parts.append(f'<rect x="{x}" y="{y}" width="{cell_w - 1}" height="{cell_h - 1}" fill="{cell_color(v)}"><title>{html.escape(gd)} {h:02d}:00 UTC: {fmt(v) or "no samples"}</title></rect>')
+		for ci, lbl in enumerate(col_labels):
+			v = grid[gd][ci]
+			x = label_w + ci * cell_w
+			parts.append(f'<rect x="{x}" y="{y}" width="{cell_w - 1}" height="{cell_h - 1}" fill="{color(v)}"><title>{html.escape(gd)} {html.escape(lbl)}: {fmt(v) or "no samples"}</title></rect>')
 			label = fmt(v)
 			if label:
-				parts.append(f'<text x="{x + cell_w // 2}" y="{y + cell_h // 2 + 4}" text-anchor="middle" fill="{cell_text_color(v)}">{label}</text>')
+				parts.append(f'<text x="{x + cell_w // 2}" y="{y + cell_h // 2 + 4}" text-anchor="middle" fill="{text_color(v)}">{label}</text>')
 	parts.append('</svg>')
-	svg = "\n".join(parts)
+	return "\n".join(parts)
+
+def write_index(output_dir, sources, samples, now):
+	gamedirs = sorted(sources.keys())
+	now_ts = int(now.timestamp())
+	hour_cutoff = now_ts - HOUR_WINDOW_HOURS * 3600
+	wday_cutoff = now_ts - WEEKDAY_WINDOW_HOURS * 3600
+
+	hour_grid = {}
+	wday_grid = {}
+	for gd in gamedirs:
+		hb = [[] for _ in range(24)]
+		wb = [[] for _ in range(7)]
+		for ts, count in samples.get(gd, []):
+			dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+			c = int(count)
+			if ts >= hour_cutoff:
+				hb[dt.hour].append(c)
+			if ts >= wday_cutoff:
+				wb[dt.weekday()].append(c)
+		hour_grid[gd] = [statistics.median(b) if b else None for b in hb]
+		wday_grid[gd] = [statistics.median(b) if b else None for b in wb]
+
+	hour_svg = heatmap_svg(gamedirs, hour_grid, [f"{h:02d}" for h in range(24)], cell_w=36)
+	wday_svg = heatmap_svg(gamedirs, wday_grid, ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], cell_w=72)
 
 	gen_iso = now.replace(microsecond=0).isoformat()
 	server_links = "\n".join(
 		f'<li><a href="v1/servers/{html.escape(gd)}">v1/servers/{html.escape(gd)}</a></li>'
 		for gd in gamedirs
 	)
-	days = SAMPLE_RETAIN_HOURS // 24
+	hour_days = HOUR_WINDOW_HOURS // 24
+	wday_weeks = WEEKDAY_WINDOW_HOURS // (7 * 24)
 
 	html_doc = f"""<!doctype html>
 <html lang="en">
@@ -158,9 +176,14 @@ body {{ font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto;
 <h1>Xash3D FWGS server list</h1>
 <p class="muted">Generated {html.escape(gen_iso)}.</p>
 
-<h2>Median concurrent players, by UTC hour, last {days} days</h2>
+<h2>Median concurrent players, by UTC hour, last {hour_days} days</h2>
 <div class="heatmap">
-{svg}
+{hour_svg}
+</div>
+
+<h2>Median concurrent players, by UTC weekday, last {wday_weeks} weeks</h2>
+<div class="heatmap">
+{wday_svg}
 </div>
 
 <h2>Lists</h2>

@@ -1,8 +1,8 @@
-# Xash3D static HTTP server list
+# Xash3D FWGS static HTTP server list
 
-Curated lists of public Xash3D / GoldSrc servers, probed on a schedule and
-published as static text files via GitHub Pages. The engine consumes them
-through the `masterstatic` directive in `xashcomm.lst`. See
+Curated lists of public Xash3D FWGS / GoldSrc servers, probed on a schedule
+and published as static text files via GitHub Pages. The engine consumes
+them through the `masterstatic` directive in `xashcomm.lst`. See
 [`Documentation/protocol/http-server-list.md`](https://github.com/FWGS/xash3d-fwgs/blob/master/Documentation/protocol/http-server-list.md)
 in xash3d-fwgs for the wire format and engine integration.
 
@@ -73,6 +73,16 @@ to maintainers but never to end users.
 - **One PR per operator.** Bundle all the servers you run into a single PR
   rather than spreading them across many. It makes review and future contact
   easier.
+- **Servers you don't own.** Some GoldSrc servers tolerate Xash3D FWGS
+  clients without explicitly endorsing them. Listing a server you don't
+  operate is allowed only for FWGS members, and:
+  - the `contact` field must be the lister's address, never the operator's;
+  - the entry is removed on any sign of pushback from the operator, no
+    discussion;
+  - if the operator asks to be delisted, it stays delisted.
+
+  We are guests on someone else's hardware. PRs from non-members adding
+  servers they don't own will be closed.
 
 ## Liveness, retries, and grace
 

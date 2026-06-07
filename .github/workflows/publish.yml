@@ -56,11 +56,6 @@ jobs:
             --grace-hours 48 \
             2>&1 | tee ./output/probe.log
 
-      - name: Add stub html
-        run: |
-          touch index.html
-          touch .nojekyll # disable jekyll
-
       - name: Force-push to gh-pages
         env:
           GH_TOKEN: ${{ github.token }}

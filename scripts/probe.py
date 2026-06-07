@@ -4,7 +4,9 @@
 # spurious failures, pruning of long-gone addresses).
 
 import argparse
+import html
 import json
+import statistics
 import subprocess
 import sys
 import time
@@ -12,13 +14,12 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
-
 PROTO_XASH = 49
 PROTO_GOLDSRC = 48
 LIVE_STATUSES = ("ok", "okwithplayers")
 BACKOFF = (0.25, 1.0, 2.0, 4.0, 4.0)
 STATE_PRUNE_HOURS = 30 * 24
-
+SAMPLE_RETAIN_HOURS = 14 * 24
 
 def probe_one(query_bin, address, timeout):
 	cmd = [query_bin, "info", address, "-j", "-c", "-P", "-t", str(int(timeout))]
@@ -78,6 +79,100 @@ def write_output(output_dir, gamedir, addresses):
 	out_path.write_text("\n".join(lines))
 	return out_path
 
+def write_index(output_dir, sources, samples, now):
+	gamedirs = sorted(sources.keys())
+
+	grid = {}
+	for gd in gamedirs:
+		buckets = [[] for _ in range(24)]
+		for ts, count in samples.get(gd, []):
+			hour = datetime.fromtimestamp(ts, tz=timezone.utc).hour
+			buckets[hour].append(int(count))
+		grid[gd] = [statistics.median(b) if b else None for b in buckets]
+
+	all_vals = [v for row in grid.values() for v in row if v is not None]
+	vmax = max(all_vals) if all_vals else 0
+
+	cell_w, cell_h = 36, 30
+	label_w = 90
+	grid_w = label_w + 24 * cell_w
+	grid_h = (len(gamedirs) + 1) * cell_h
+
+	def cell_color(v):
+		if v is None:
+			return "#f3f4f6"
+		if vmax <= 0:
+			return "#eef2ff"
+		t = (v / vmax) ** 0.6
+		r = int(238 + (49 - 238) * t)
+		g = int(242 + (46 - 242) * t)
+		b = int(255 + (129 - 255) * t)
+		return f"#{r:02x}{g:02x}{b:02x}"
+
+	def cell_text_color(v):
+		if v is None or vmax <= 0:
+			return "#9ca3af"
+		return "#ffffff" if (v / vmax) > 0.45 else "#1f2937"
+
+	def fmt(v):
+		if v is None:
+			return ""
+		if v == int(v):
+			return str(int(v))
+		return f"{v:.1f}"
+
+	parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {grid_w} {grid_h}" width="100%" style="max-width:{grid_w}px" font-family="system-ui,sans-serif" font-size="11">']
+	for h in range(24):
+		x = label_w + h * cell_w + cell_w // 2
+		parts.append(f'<text x="{x}" y="{cell_h // 2 + 4}" text-anchor="middle" fill="#6b7280">{h:02d}</text>')
+	for ri, gd in enumerate(gamedirs):
+		y = (ri + 1) * cell_h
+		parts.append(f'<text x="{label_w - 8}" y="{y + cell_h // 2 + 4}" text-anchor="end" fill="#1f2937">{html.escape(gd)}</text>')
+		for h in range(24):
+			v = grid[gd][h]
+			x = label_w + h * cell_w
+			parts.append(f'<rect x="{x}" y="{y}" width="{cell_w - 1}" height="{cell_h - 1}" fill="{cell_color(v)}"><title>{html.escape(gd)} {h:02d}:00 UTC: {fmt(v) or "no samples"}</title></rect>')
+			label = fmt(v)
+			if label:
+				parts.append(f'<text x="{x + cell_w // 2}" y="{y + cell_h // 2 + 4}" text-anchor="middle" fill="{cell_text_color(v)}">{label}</text>')
+	parts.append('</svg>')
+	svg = "\n".join(parts)
+
+	gen_iso = now.replace(microsecond=0).isoformat()
+	server_links = "\n".join(
+		f'<li><a href="v1/servers/{html.escape(gd)}">v1/servers/{html.escape(gd)}</a></li>'
+		for gd in gamedirs
+	)
+	days = SAMPLE_RETAIN_HOURS // 24
+
+	html_doc = f"""<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Xash3D FWGS server list</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body {{ font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; color: #1f2937; }}
+.muted {{ color: #6b7280; }}
+.heatmap {{ overflow-x: auto; margin: 1rem 0; }}
+</style>
+<h1>Xash3D FWGS server list</h1>
+<p class="muted">Generated {html.escape(gen_iso)}.</p>
+
+<h2>Median concurrent players, by UTC hour, last {days} days</h2>
+<div class="heatmap">
+{svg}
+</div>
+
+<h2>Lists</h2>
+<ul>
+{server_links}
+</ul>
+
+<p><a href="https://github.com/FWGS/server-list">Source and contribution policy</a></p>
+"""
+	(output_dir / "index.html").write_text(html_doc)
+	(output_dir / ".nojekyll").write_text("")
+
 def load_state(path):
 	if not path.exists():
 		return {}
@@ -135,9 +230,14 @@ def main():
 	grace_kept = 0
 	print(f"probing {total} servers across {len(sources)} gamedirs  (tries={args.tries}, timeout={args.timeout}s, grace={args.grace_hours}h)", flush=True)
 
+	samples = state.setdefault("samples", {})
+	now_ts = int(now.timestamp())
+
 	for gamedir, entries in sources.items():
 		gd_state = state.setdefault(gamedir, {})
 		live_addrs = []
+		gd_players = 0
+		gd_responding = 0
 
 		for entry in entries:
 			address = entry.get("address")
@@ -155,7 +255,10 @@ def main():
 				# use the source's protocol, not the responder's
 				live_addrs.append((address, proto))
 				live_now += 1
-				print(f"  [+] {gamedir:>12}  {address}  ping={result.get('ping')}ms", flush=True)
+				numcl = int(result.get("numcl") or 0)
+				gd_players += numcl
+				gd_responding += 1
+				print(f"  [+] {gamedir:>12}  {address}  ping={result.get('ping')}ms  players={numcl}", flush=True)
 				continue
 
 			age = hours_since(prev.get("last_seen"), now)
@@ -173,9 +276,14 @@ def main():
 		out_path = write_output(output_dir, gamedir, live_addrs)
 		print(f"  -> {out_path}  ({len(live_addrs)} published)", flush=True)
 
+		if gd_responding > 0:
+			samples.setdefault(gamedir, []).append([now_ts, gd_players])
+
 	source_addrs = {gd: {e["address"] for e in entries if e.get("address")} for gd, entries in sources.items()}
 	pruned = 0
 	for gd in list(state.keys()):
+		if gd == "samples":
+			continue
 		if gd not in source_addrs:
 			for addr, entry in list(state[gd].items()):
 				if hours_since(entry.get("last_seen"), now) > STATE_PRUNE_HOURS:
@@ -191,9 +299,20 @@ def main():
 				del state[gd][addr]
 				pruned += 1
 
+	sample_cutoff = now_ts - SAMPLE_RETAIN_HOURS * 3600
+	samples_pruned = 0
+	for gd in list(samples.keys()):
+		kept = [s for s in samples[gd] if s[0] >= sample_cutoff]
+		samples_pruned += len(samples[gd]) - len(kept)
+		if gd not in sources and not kept:
+			del samples[gd]
+			continue
+		samples[gd] = kept
+
+	write_index(output_dir, sources, samples, now)
 	save_state(state_path, state)
 
-	print(f"done: {live_now} responded, {grace_kept} kept by grace, {pruned} pruned from state", flush=True)
+	print(f"done: {live_now} responded, {grace_kept} kept by grace, {pruned} pruned from state, {samples_pruned} old samples dropped", flush=True)
 	return 0
 
 
